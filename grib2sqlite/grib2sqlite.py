@@ -1136,10 +1136,8 @@ def parse_grib_file(
       ensemble: if True, treat the file as an ensemble GRIB file.
                 Member data are stored in columns named <model_name>_mbr001 etc.
                 The _det suffix is NOT added when ensemble=True.
-                The productDefinitionTemplateNumber and typeOfStatisticalProcessing
-                constraints are automatically stripped from the param list so that
-                a deterministic param list can be reused without modification.
-
+                Note that the productDefinitionTemplateNumber and typeOfStatisticalProcessing
+                keys differ from deterministic, therefore the param_list must be eps-specific.
     Returns:
         Total number of GRIB records and number of matching parameters found.
     """
