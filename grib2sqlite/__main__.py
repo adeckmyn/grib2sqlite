@@ -31,6 +31,12 @@ parser.add_argument('-d', metavar="debug_level",
     help="verbosity level (0...3) default: 1",
     default = 1)
 
+parser.add_argument(
+    '-e', '--ensemble',
+    action='store_true',
+    help="treat input as ensemble GRIB file (members stored in _mbr001, _mbr002, ... columns)",
+)
+
 args = parser.parse_args()
 if args.d == 0:
     logger.setLevel('ERROR')
@@ -85,5 +91,6 @@ for file_glob in infile:
             station_list = station_file,
             sqlite_template = sqlite_template,
             model_name = model_name,
-            weights = None)
+            weights = None,
+            ensemble = args.ensemble)        
 

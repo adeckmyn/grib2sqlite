@@ -4,6 +4,7 @@
 import logging
 import os
 import sqlite3
+import threading
 from contextlib import closing
 from copy import deepcopy
 from datetime import datetime
@@ -27,6 +28,31 @@ basedir = os.path.dirname(__file__)
 default_parameter_list = basedir + "/data/param_list_default.json"
 default_station_list = basedir + "/data/station_list_default.csv"
 default_sqlite_template = "{MODEL}/{YYYY}/{MM}/FCTABLE_{PP}_{YYYY}{MM}.sqlite"
+
+# Per-SQLite-file locks used by parallel workers (threads) to serialise the
+# file-creation step and avoid "duplicate column name" races.
+_sqlite_file_locks: dict = {}
+_sqlite_file_locks_lock = threading.Lock()
+
+
+def _get_file_lock(path: str) -> threading.Lock:
+    """Return a per-file threading.Lock, creating it on first use.
+
+    All workers that share the same process (e.g. ThreadPoolExecutor) will
+    receive the same lock object for the same absolute path, serialising the
+    SQLite file-creation and schema-patching steps without blocking unrelated
+    files.
+
+    Args:
+        path: absolute or relative path to the SQLite file
+
+    Returns:
+        A threading.Lock unique to this path.
+    """
+    with _sqlite_file_locks_lock:
+        if path not in _sqlite_file_locks:
+            _sqlite_file_locks[path] = threading.Lock()
+        return _sqlite_file_locks[path]
 
 
 def read_param_list(param_file):
@@ -350,6 +376,41 @@ def get_keylist(gid, keylist, ktype="string"):
     return ginfo
 
 
+def get_ensemble_info(gid):
+    """Read ensemble member information from a GRIB record.
+
+    Args:
+        gid: GRIB handle
+
+    Returns:
+        A tuple (perturbation_number, n_members) where both are None if the
+        record does not belong to an ensemble.
+    """
+    info = get_keylist(
+        gid,
+        ["perturbationNumber", "numberOfForecastsInEnsemble"],
+        "long",
+    )
+    pert = info["perturbationNumber"]
+    n_members = info["numberOfForecastsInEnsemble"]
+    # eccodes returns None for missing keys; treat 0 members as non-ensemble too
+    if pert is None or n_members is None or n_members == 0:
+        return None, None
+    return int(pert), int(n_members)
+
+
+def mbr_column(model_name, perturbation_number):
+    """Build the SQLite column name for a given ensemble member.
+
+    Args:
+        model_name: base model name (without any suffix)
+        perturbation_number: integer member index (1-based)
+
+    Returns:
+        column name string, e.g. "AROME_mbr003"
+    """
+    return f"{model_name}_mbr{perturbation_number:03d}"
+    
 def param_match(gid, parameter_list):
     """Check whether a grib record is in the list of required parameters.
 
@@ -963,6 +1024,97 @@ def cache_field(param, data, param_cmb_list, gid):
     return count
 
 
+def cache_field_ensemble(param, data, param_cmb_list, gid, perturbation_number):
+    """Cache a decoded field for a specific ensemble member in combined parameters.
+
+    Unlike cache_field (which overwrites a single data slot), this function
+    stores each member's component data separately under
+    cmb["member_data"][perturbation_number][field_index], so that
+    combine_fields can later be called independently for every member.
+
+    Args:
+      param              : parameter description of the current data
+      data               : interpolated data vector for this member
+      param_cmb_list     : list of combined parameter descriptors (MODIFIED in place)
+      gid                : GRIB handle (for projection / grid info)
+      perturbation_number: integer member number (1-based)
+
+    Returns:
+      Count of combined parameters that matched.
+    """
+    count = 0
+    gridinfo_list = ["uvRelativeToGrid"]
+    for cmb in param_cmb_list:
+        nfields = len(cmb["grib_id"])
+        for ff in range(nfields):
+            if match_keys(cmb["grib_id"][ff], param["grib_id"]):
+                logger.debug(
+                    "Caching ensemble member %i for %s",
+                    perturbation_number,
+                    cmb["harp_param"],
+                )
+                # Initialise per-member storage on first encounter
+                if "member_data" not in cmb:
+                    cmb["member_data"] = {}
+                if perturbation_number not in cmb["member_data"]:
+                    cmb["member_data"][perturbation_number] = [None] * nfields
+                cmb["member_data"][perturbation_number][ff] = np.array(data)
+
+                # These are the same for all members — set once
+                cmb["units"] = param["units"]
+                cmb["level"] = param["level"]
+                cmb["level_name"] = param["level_name"]
+                if cmb["gridinfo"] is None:
+                    cmb["gridinfo"] = get_keylist(gid, gridinfo_list, "long")
+                    cmb["proj4"] = get_proj4(gid)
+                count += 1
+                continue
+    logger.debug("Found %i matching combined parameters for member %i.", count, perturbation_number)
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Ensemble accumulator
+# ---------------------------------------------------------------------------
+
+class _EnsembleAccumulator:
+    """Collect interpolated member data for one (param, fcdate, leadtime) slot.
+
+    The accumulator waits until all members have been seen before flushing
+    to SQLite.  Member numbers are 1-based (as reported by perturbationNumber).
+
+    Attributes:
+        n_members  : total number of members expected
+        members    : dict mapping perturbation_number -> data_vector
+        param      : parameter descriptor (from the first member seen)
+        fcdate     : forecast date
+        leadtime   : lead time in seconds
+    """
+
+    def __init__(self, n_members, param, fcdate, leadtime):
+        self.n_members = n_members
+        self.param = deepcopy(param)
+        self.fcdate = fcdate
+        self.leadtime = leadtime
+        self.members = {}  # {perturbation_number: data_vector}
+
+    def add(self, perturbation_number, data_vector):
+        self.members[perturbation_number] = data_vector
+
+    @property
+    def is_complete(self):
+        return len(self.members) == self.n_members
+
+    def missing_members(self):
+        return sorted(set(range(0, self.n_members + 1)) - set(self.members.keys()))
+
+
+def _ens_key(param, fcdate, leadtime):
+    """Hashable key for the ensemble accumulator dict."""
+    level = param.get("level")
+    return (param["harp_param"], fcdate, leadtime, level)
+
+
 def parse_grib_file(
     infile,
     param_list=default_parameter_list,
@@ -970,6 +1122,7 @@ def parse_grib_file(
     sqlite_template=default_sqlite_template,
     weights=None,
     model_name="TEST",
+    ensemble=False,
 ):
     """Read a GRIB2 file and extract all required data points to SQLite.
 
@@ -980,7 +1133,11 @@ def parse_grib_file(
       sqlite_template: template for sqlite output files
       weights: interpolation weights (if None, they are calculated)
       model_name: model name (string) used in the SQLite file name and data columns
-
+      ensemble: if True, treat the file as an ensemble GRIB file.
+                Member data are stored in columns named <model_name>_mbr001 etc.
+                The _det suffix is NOT added when ensemble=True.
+                Note that the productDefinitionTemplateNumber and typeOfStatisticalProcessing
+                keys differ from deterministic, therefore the param_list must be eps-specific.
     Returns:
         Total number of GRIB records and number of matching parameters found.
     """
@@ -1001,6 +1158,10 @@ def parse_grib_file(
         len(param_sgl_list),
         len(param_cmb_list),
     )
+
+    # For ensemble mode: accumulate member data before writing.
+    # Key: _ens_key(param, fcdate, leadtime)  ->  _EnsembleAccumulator
+    ens_accumulators = {}
 
     fcdate = None
     leadtime = None
@@ -1076,31 +1237,64 @@ def parse_grib_file(
 
             # by default, we do bilinear interpolation
             method = param["method"] if "method" in param else "bilin"
-            # add columns to data table
+            # interpolate to station points
             data_vector = interp_from_weights(gid, weights, method)
 
-            # cache this data vector if necessary
-            # NOTE: a "direct" field may also be part of a combined field
-            #       so we can not be sure without checking explicitly.
-            # we may need to add some encoding information
-            # like projection & uvRelativeToGrid for wind
-            # so we pass gid along as well
-            cache_field(param, data_vector, param_cmb_list, gid)
+            # ------------------------------------------------------------------
+            # ENSEMBLE branch
+            # ------------------------------------------------------------------
+            if ensemble:
+                perturbation_number, n_members = get_ensemble_info(gid)
 
-            # if this is a "direct" field, create a table and write to SQLite
-            if direct:
-                sqlite_file = sqlite_name(param, fcdate, model_name, sqlite_template)
-                # NOTE: the column name for data gets an extra "_det"
-                #       as required by HARP
-                data = create_table(
-                    data_vector,
-                    station_list,
-                    param,
-                    fcdate,
-                    leadtime,
-                    model_name + "_det",
-                )
-                write_to_sqlite(data, sqlite_file, param, model_name + "_det")
+                if perturbation_number is None:
+                    logger.warning(
+                        "SQLITE: ensemble=True but record has no perturbationNumber "
+                        "for parameter %s – skipping.",
+                        param["harp_param"],
+                    )
+                    eccodes.codes_release(gid)
+                    continue
+
+                # Cache data for combined parameters (wind speed/direction etc.)
+                # Each member's components are stored separately so that
+                # combine_fields can be called independently per member.
+                cache_field_ensemble(param, data_vector, param_cmb_list, gid, perturbation_number)
+
+                if direct:
+                    key = _ens_key(param, fcdate, leadtime)
+                    if key not in ens_accumulators:
+                        ens_accumulators[key] = _EnsembleAccumulator(
+                            n_members, param, fcdate, leadtime
+                        )
+                    ens_accumulators[key].add(perturbation_number, data_vector)
+
+                    if ens_accumulators[key].is_complete:
+                        accum = ens_accumulators.pop(key)
+                        _flush_ensemble(
+                            accum, station_list, model_name, sqlite_template
+                        )
+
+            # ------------------------------------------------------------------
+            # DETERMINISTIC branch  (original logic, unchanged)
+            # ------------------------------------------------------------------
+            else:
+                # cache data for combined parameters (wind speed/direction etc.)
+                cache_field(param, data_vector, param_cmb_list, gid)
+
+                # if this is a "direct" field, create a table and write to SQLite
+                if direct:
+                    sqlite_file = sqlite_name(param, fcdate, model_name, sqlite_template)
+                    # NOTE: the column name for data gets an extra "_det"
+                    #       as required by HARP
+                    data = create_table(
+                        data_vector,
+                        station_list,
+                        param,
+                        fcdate,
+                        leadtime,
+                        model_name + "_det",
+                    )
+                    write_to_sqlite(data, sqlite_file, param, model_name + "_det")
 
             eccodes.codes_release(gid)
 
@@ -1109,21 +1303,77 @@ def parse_grib_file(
         logger.error("An error occured. Exiting.")
         return gt, gi
 
-    # OK, we have parsed the whole file and written all "direct" parameters
-    # So now we still need to check all the "combined" ones
-    # NOTE: this should only be run if we found some parameters in the first loop
-    #       but checking whether the combined field is None is enough
+    # Flush any accumulators that never reached n_members (missing members at
+    # end of file).  This is normal for split ensemble files where the control
+    # member (e.g. member 51) lives in a separate file.
+    for key, accum in ens_accumulators.items():
+        missing = accum.missing_members()
+        logger.info(
+            "SQLITE: partial ensemble flush for %s fcdate=%s leadtime=%s – "
+            "members not in this file: %s.",
+            accum.param["harp_param"],
+            accum.fcdate,
+            accum.leadtime,
+            missing,
+        )
+        _flush_ensemble(accum, station_list, model_name, sqlite_template)
+
+    # Check all combined parameters and write to SQLite
     logger.debug("SQLITE: checking cached combined fields")
     for param in param_cmb_list:
-        data_vector = combine_fields(param, station_list)
-        # only write to SQLite if ALL components were found!
-        if data_vector is not None:
-            logger.debug("SQLITE: writing combined field")
-            sqlite_file = sqlite_name(param, fcdate, model_name, sqlite_template)
-            data = create_table(
-                data_vector, station_list, param, fcdate, leadtime, model_name + "_det"
-            )
-            write_to_sqlite(data, sqlite_file, param, model_name + "_det")
+        if ensemble:
+            # In ensemble mode each member's components were stored separately
+            # by cache_field_ensemble.  Combine and accumulate per member, then
+            # flush exactly like a direct ensemble parameter.
+            member_data = param.get("member_data", {})
+            if not member_data:
+                logger.info(
+                    "COMBINE: no ensemble member data cached for %s.", param["harp_param"]
+                )
+                continue
+
+            # Determine n_members from any available accumulator, or fall back
+            # to the number of members actually seen for this combined param.
+            n_members = max(member_data.keys())
+
+            cmb_accum = _EnsembleAccumulator(n_members, param, fcdate, leadtime)
+            for mbr_num, component_data in member_data.items():
+                # Temporarily swap in this member's component data so that
+                # combine_fields (which reads param["data"]) works unchanged.
+                param["data"] = component_data
+                data_vector = combine_fields(param, station_list)
+                if data_vector is not None:
+                    cmb_accum.add(mbr_num, data_vector)
+                else:
+                    logger.info(
+                        "COMBINE: missing component for %s member %i – skipping member.",
+                        param["harp_param"],
+                        mbr_num,
+                    )
+
+            if cmb_accum.members:
+                missing = cmb_accum.missing_members()
+                if missing:
+                    logger.info(
+                        "SQLITE: partial combined ensemble flush for %s – "
+                        "members not in this file: %s.",
+                        param["harp_param"],
+                        missing,
+                    )
+                _flush_ensemble(cmb_accum, station_list, model_name, sqlite_template)
+        else:
+            # Deterministic: single combine_fields call, write directly.
+            data_vector = combine_fields(param, station_list)
+            # only write to SQLite if ALL components were found!
+            if data_vector is not None:
+                logger.debug("SQLITE: writing combined field")
+                sqlite_file = sqlite_name(param, fcdate, model_name, sqlite_template)
+                col_name = model_name + "_det"
+                data = create_table(
+                    data_vector, station_list, param, fcdate, leadtime, col_name
+                )
+                write_to_sqlite(data, sqlite_file, param, col_name)
+
     logger.info(
         "SQLITE: Total %i records. %i matching of which %i direct and %i combined.",
         gt,
@@ -1133,6 +1383,183 @@ def parse_grib_file(
     )
     # Return: total count and # of matching param
     return gt, gi
+
+
+# ---------------------------------------------------------------------------
+# Ensemble flush helper
+# ---------------------------------------------------------------------------
+
+def _flush_ensemble(accum, station_list, model_name, sqlite_template):
+    """Write all accumulated ensemble members for one (param, fcdate, leadtime) to SQLite.
+
+    Each member is stored in a separate column named <model_name>_mbr001, …
+
+    Args:
+        accum          : a completed (or partial) _EnsembleAccumulator
+        station_list   : pandas table with station info
+        model_name     : base model name (no suffix)
+        sqlite_template: template string for the output SQLite path
+    """
+    param = accum.param
+    fcdate = accum.fcdate
+    leadtime = accum.leadtime
+
+    sqlite_file = sqlite_name(param, fcdate, model_name, sqlite_template)
+
+    # Serialise file creation and schema patching across parallel workers.
+    # Without this lock, two threads can both see os.path.isfile()==False and
+    # both call _db_create_ensemble, producing "duplicate column name" errors.
+    file_lock = _get_file_lock(sqlite_file)
+    with file_lock:
+        if not os.path.isfile(sqlite_file):
+            sqlite_path = os.path.dirname(sqlite_file)
+            if sqlite_path and not os.path.isdir(sqlite_path):
+                logger.info("SQLITE: Creating directory %s.", sqlite_path)
+                os.makedirs(sqlite_path)
+            logger.info("SQLITE: Creating ensemble sqlite file %s.", sqlite_file)
+            _db_create_ensemble(sqlite_file, param, model_name, accum.n_members)
+            needs_column_check = False
+        else:
+            # File pre-existed: patch any member columns that may be missing
+            # (e.g. file created by an earlier partial flush or a different run).
+            needs_column_check = True
+
+        con = sqlite3.connect(sqlite_file)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout = 30000")  # wait up to 30 s before failing
+
+        if needs_column_check:
+            _ensure_member_columns(con, model_name, sorted(accum.members.keys()))
+
+        con.commit()
+        con.execute("PRAGMA busy_timeout = 30000")  # wait up to 30 s before failing
+
+    # Schema is now stable — the data write itself is safe outside the lock
+    # because SQLite WAL mode allows concurrent writers at the row level.
+    con = sqlite3.connect(sqlite_file)
+    con.execute("PRAGMA journal_mode=WAL")
+
+    fcd = float(fcdate.timestamp())
+    db_cleanup(param, fcd, float(leadtime / 3600.0), con)
+
+    # Build one combined pandas table with all member columns in a single pass.
+    first_mbr_num = sorted(accum.members.keys())[0]
+    first_col = mbr_column(model_name, first_mbr_num)
+
+    combined = create_table(
+        accum.members[first_mbr_num],
+        station_list,
+        param,
+        fcdate,
+        leadtime,
+        first_col,
+    )
+    # Add remaining member columns (first_col is already set above)
+    for mbr_num, data_vector in sorted(accum.members.items()):
+        col = mbr_column(model_name, mbr_num)
+        combined[col] = data_vector
+
+    combined.to_sql("FC", con, if_exists="append", index=False)
+    con.commit()
+    con.close()
+
+    logger.debug(
+        "SQLITE: flushed %i members for %s fcdate=%s leadtime=%s",
+        len(accum.members),
+        param["harp_param"],
+        fcdate,
+        leadtime,
+    )
+
+
+def _db_create_ensemble(sqlite_file, param, model_name, n_members):
+    """Create a new SQLite file with an FC table for ensemble data.
+
+    The table contains one column per member: <model_name>_mbr001, …
+
+    Args:
+        sqlite_file : path to the SQLite file to create
+        param       : parameter descriptor
+        model_name  : base model name
+        n_members   : total number of ensemble members
+    """
+    primary_keys, other_keys = _fctable_definition_ensemble(param, model_name, n_members)
+    all_keys = {**primary_keys, **other_keys}
+
+    fc_def = (
+        "CREATE table if not exists FC ("
+        + ",".join(f"{p[0]} {p[1]} " for p in all_keys.items())
+        + ")"
+    )
+    pk_def = (
+        "CREATE unique INDEX IF NOT EXISTS "
+        + "index_"
+        + "_".join(primary_keys.keys())
+        + " ON FC("
+        + ",".join(primary_keys.keys())
+        + ")"
+    )
+
+    con = sqlite3.connect(sqlite_file)
+    with con, closing(con.cursor()) as cur:
+        cur.execute(fc_def)
+        cur.execute(pk_def)
+    con.close()
+
+
+def _fctable_definition_ensemble(param, model_name, n_members):
+    """Build the SQL column definition for an ensemble FC table.
+
+    Args:
+        param      : parameter descriptor
+        model_name : base model name
+        n_members  : number of ensemble members
+
+    Returns:
+        (primary_keys, other_keys) – both ordered dicts of {col_name: sql_type}
+    """
+    primary_keys = {"fcst_dttm": "DOUBLE", "lead_time": "DOUBLE", "SID": "INT"}
+    if param.get("level_name") in ["z", "p", "h"]:
+        primary_keys[param["level_name"]] = "INT"
+
+    other_keys = {
+        "lat": "DOUBLE",
+        "lon": "DOUBLE",
+        "valid_dttm": "INT",
+        "parameter": "TEXT",
+        "units": "TEXT",
+    }
+    # one column per member
+    for mbr in range(0, n_members + 1):
+        other_keys[mbr_column(model_name, mbr)] = "DOUBLE"
+
+    # T2m elevation correction columns
+    if "T2m" in param.get("harp_param", ""):
+        other_keys["elev"] = "DOUBLE"
+        other_keys["model_elevation"] = "DOUBLE"
+
+    return primary_keys, other_keys
+
+
+def _ensure_member_columns(con, model_name, member_numbers):
+    """Add any missing _mbrNNN columns to an existing FC table.
+
+    This is needed when the SQLite file was created by an earlier run
+    with a different (smaller) member set.
+
+    Args:
+        con            : open sqlite3 connection
+        model_name     : base model name
+        member_numbers : iterable of integer member numbers
+    """
+    cur = con.cursor()
+    # PRAGMA table_info returns rows of (cid, name, type, notnull, dflt_value, pk)
+    existing = {row[1] for row in cur.execute("PRAGMA table_info(FC)").fetchall()}
+    for mbr in member_numbers:
+        col = mbr_column(model_name, mbr)
+        if col not in existing:
+            cur.execute(f"ALTER TABLE FC ADD COLUMN {col} DOUBLE")
+    con.commit()
 
 
 def create_table(data_vector, station_list, param, fcdate, leadtime, model_name):
@@ -1158,7 +1585,7 @@ def create_table(data_vector, station_list, param, fcdate, leadtime, model_name)
     ):
         prim_keys.append("elev")
     data = station_list[prim_keys].copy()
-    # NOTE: only deterministic mnodels for now! No EPS.
+    # NOTE: only deterministic models for now! No EPS.
     data[model_name] = data_vector
 
     # prepare SQLITE output
@@ -1186,7 +1613,7 @@ def create_table(data_vector, station_list, param, fcdate, leadtime, model_name)
         if "elev" in data.columns.to_numpy().tolist():
             data = data.drop("elev", axis=1)
 
-    if param["level"] is not None and param["level_name"] is not None:  #  "level"]):
+    if param["level"] is not None and param["level_name"] is not None:
         data[param["level_name"]] = int(param["level"])
     return data
 
@@ -1204,6 +1631,8 @@ def write_to_sqlite(data, sqlite_file, param, model_name):
 
     if os.path.isfile(sqlite_file):
         con = sqlite3.connect(sqlite_file)
+        con.execute("PRAGMA journal_mode=WAL")
+        con.execute("PRAGMA busy_timeout=30000")
         # NOTE: If the table already exists,
         #       we must check that all column names match!
         #       Especially, we must check that the model name is identical.
