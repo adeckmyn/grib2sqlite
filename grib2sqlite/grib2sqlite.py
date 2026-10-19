@@ -1,4 +1,3 @@
-#! /usr/bin/env python3
 """grib2sqlite: toolbox for extracting point data from GRIB fields."""
 
 import logging
@@ -818,7 +817,7 @@ def combine_fields(param, station_list):
 
         lat = np.array(station_list["lat"].tolist())
         lon = np.array(station_list["lon"].tolist())
-        angle, mapfactor = rotate_wind(lon, lat, param["proj4"])
+        angle, _mapfactor = rotate_wind(lon, lat, param["proj4"])
 
         return np.sqrt(result)  # * mapfactor ???
 
@@ -851,7 +850,7 @@ def combine_fields(param, station_list):
             lat = np.array(station_list["lat"].tolist())
             lon = np.array(station_list["lon"].tolist())
             logger.debug("Correcting wind angle.")
-            angle, mapfactor = rotate_wind(lon, lat, param["proj4"])
+            angle, _mapfactor = rotate_wind(lon, lat, param["proj4"])
             wdir = wdir + angle
 
         return wdir
@@ -1106,7 +1105,7 @@ class _EnsembleAccumulator:
         return len(self.members) == self.n_members
 
     def missing_members(self):
-        return sorted(set(range(0, self.n_members + 1)) - set(self.members.keys()))
+        return sorted(set(range(self.n_members + 1)) - set(self.members.keys()))
 
 
 def _ens_key(param, fcdate, leadtime):
@@ -1236,7 +1235,7 @@ def parse_grib_file(
                 weights = train_weights(station_list, gid, lsm=False)
 
             # by default, we do bilinear interpolation
-            method = param["method"] if "method" in param else "bilin"
+            method = param.get("method", "bilin")
             # interpolate to station points
             data_vector = interp_from_weights(gid, weights, method)
 
@@ -1443,7 +1442,7 @@ def _flush_ensemble(accum, station_list, model_name, sqlite_template):
     db_cleanup(param, fcd, float(leadtime / 3600.0), con)
 
     # Build one combined pandas table with all member columns in a single pass.
-    first_mbr_num = sorted(accum.members.keys())[0]
+    first_mbr_num = min(accum.members.keys())
     first_col = mbr_column(model_name, first_mbr_num)
 
     combined = create_table(
@@ -1530,7 +1529,7 @@ def _fctable_definition_ensemble(param, model_name, n_members):
         "units": "TEXT",
     }
     # one column per member
-    for mbr in range(0, n_members + 1):
+    for mbr in range(n_members + 1):
         other_keys[mbr_column(model_name, mbr)] = "DOUBLE"
 
     # T2m elevation correction columns

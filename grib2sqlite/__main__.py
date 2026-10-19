@@ -1,11 +1,12 @@
-from .__init__ import * 
-
-"""Command line version."""
-import argparse
+import os
+import sys
+from argparse import ArgumentParser
 from glob import glob
-import json
-import pandas 
-parser = argparse.ArgumentParser(prog="extractsqlite")
+
+from .__init__ import basedir, logger
+from .grib2sqlite import parse_grib_file
+
+parser = ArgumentParser(prog="extractsqlite")
 current_wdir = os.getcwd()
 # positional argument:
 # we allow multiple GRIB files, but some might even be globs
@@ -63,7 +64,7 @@ logger.info(f"Output files   : {sqlite_template}")
 
 if len(infile) == 0:
     logger.error("No input GRIB file given.")
-    exit()
+    sys.exit()
 
 logger.debug(f"Total file input: {infile}")
 iter = 0
