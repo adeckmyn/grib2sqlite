@@ -399,21 +399,6 @@ def get_ensemble_info(gid):
     return int(pert), int(n_members)
 
 
-def mbr_column(model_name, perturbation_number):
-    """Build the SQLite column name for a given ensemble member.
-
-    Args:
-        model_name: base model name (without any suffix)
-        perturbation_number: integer member index (1-based)
-
-    Returns:
-        column name string, e.g. "AROME_mbr003"
-    """
-    if perturbation_number is None:
-        return model_name + "_det"
-    else:
-        return f"{model_name}_mbr{perturbation_number:03d}"
-    
 def param_match(gid, parameter_list):
     """Check whether a grib record is in the list of required parameters.
 
@@ -898,11 +883,11 @@ def parse_parameter_list(param_list):
     Handle single vs combined fields, model levels etc.
 
     Args:
-        param_list: the list pf paramers (from json file)
+        param_list: the list of parameters (from json file)
 
     Returns:
-        param_id_list: the complete list of fields that should be decoded
-        param_combine: details for combined fields
+        param_sgl_list: the list of fields that should be decoded
+        param_cmb_list: details for combined fields
     """
     param_sgl_list = []
     param_cmb_list = []
@@ -1040,6 +1025,13 @@ def cache_field(param, data, param_cmb_list, gid, perturbation_number=None):
 # Ensemble accumulator
 # ---------------------------------------------------------------------------
 
+
+# TODO: we could also use a pandas dataframe or numpy array to store the member data
+#       that would probably be more efficient than a dict of numpy vectors,
+#       but it would be more complicated to implement.
+# TODO: we could also use the accumulator format for deterministic models (ensemble or not)       for combined paramete but may require some work. For single fields, not really much point.
+#       for combined parameters but may require some work. For single fields, not really
+#       much point.
 class _EnsembleAccumulator:
     """Collect interpolated member data for one (param, fcdate, leadtime) slot.
 
@@ -1238,10 +1230,10 @@ def parse_grib_file(
                             accum, station_list, model_name, sqlite_template
                         )
                 else:
-                    # if this is a "direct" field, create a table and write to SQLite
-                    sqlite_file = sqlite_name(param, fcdate, model_name, sqlite_template)
-                    # NOTE: the column name for data gets an extra "_det"
-                    #       as required by HARP
+                    # this is a "direct" field, create a table and write to SQLite
+                    sqlite_file = sqlite_name(
+                        param, fcdate, model_name, sqlite_template
+                    )
                     data = create_table(
                         data_vector,
                         station_list,
@@ -1250,7 +1242,7 @@ def parse_grib_file(
                         leadtime,
                         model_name + "_det",
                     )
-                    write_to_sqlite(data, sqlite_file, param, model_name + "_det")
+                    write_to_sqlite(data, sqlite_file, param, model_name, None)
 
             eccodes.codes_release(gid)
 
@@ -1284,7 +1276,8 @@ def parse_grib_file(
             member_data = param.get("member_data", {})
             if not member_data:
                 logger.info(
-                    "COMBINE: no ensemble member data cached for %s.", param["harp_param"]
+                    "COMBINE: no ensemble member data cached for %s.",
+                    param["harp_param"],
                 )
                 continue
 
@@ -1296,6 +1289,8 @@ def parse_grib_file(
             for mbr_num, component_data in member_data.items():
                 # Temporarily swap in this member's component data so that
                 # combine_fields (which reads param["data"]) works unchanged.
+                # TODO: we should modify combine_fields to accept an ensemble data argument.
+
                 param["data"] = component_data
                 data_vector = combine_fields(param, station_list)
                 if data_vector is not None:
@@ -1345,6 +1340,7 @@ def parse_grib_file(
 # Ensemble flush helper
 # ---------------------------------------------------------------------------
 
+
 def _flush_ensemble(accum, station_list, model_name, sqlite_template):
     """Write all accumulated ensemble members for one (param, fcdate, leadtime) to SQLite.
 
@@ -1362,7 +1358,144 @@ def _flush_ensemble(accum, station_list, model_name, sqlite_template):
     n_members = accum.n_members
 
     sqlite_file = sqlite_name(param, fcdate, model_name, sqlite_template)
+    # Build one combined pandas table with all member columns in a single pass.
+    table = create_table(
+        accum.members,
+        station_list,
+        param,
+        fcdate,
+        leadtime,
+        model_name,
+    )
+    write_to_sqlite(sqlite_file, table, param, model_name, n_members)
 
+    logger.debug(
+        "SQLITE: flushed %i members for %s fcdate=%s leadtime=%s",
+        len(accum.members),
+        param["harp_param"],
+        fcdate,
+        leadtime,
+    )
+
+
+def ensure_table_columns(con, member_columns):
+    """Add any missing _mbrNNN columns to an existing FC table.
+
+    This is needed when the SQLite file was created by an earlier run
+    with a different (smaller) member set.
+
+    Args:
+        con            : open sqlite3 connection
+        member_columns : iterable of column names
+    """
+    # PRAGMA table_info returns rows of (cid, name, type, notnull, dflt_value, pk)
+
+    with con, closing(con.cursor()) as cur:
+        existing = {row[1] for row in cur.execute("PRAGMA table_info(FC)").fetchall()}
+        for col in sorted(member_columns):
+            if col not in existing:
+                cur.execute(f"ALTER TABLE FC ADD COLUMN {col} DOUBLE")
+
+
+def mbr_column(model_name, perturbation_number):
+    """Build the SQLite column name for a given ensemble member.
+
+    Args:
+        model_name: base model name (without any suffix)
+        perturbation_number: integer member index (1-based)
+
+    Returns:
+        column name string, e.g. "AROME_mbr003"
+    """
+    if perturbation_number is None:
+        return f"{model_name}_det"
+    else:
+        return f"{model_name}_mbr{perturbation_number:03d}"
+
+
+def list_mbr_columns(table, model_name):
+    """List all ensemble member columns in a pandas table.
+
+    Args:
+        table: pandas DataFrame
+        model_name: base model name (without any suffix)
+
+    Returns:
+        list of column names
+    """
+    return [col for col in table.columns if model_name in col]
+
+
+def create_table(data, station_list, param, fcdate, leadtime, model_name):
+    """Put a data vector (interpolated field) to pandas table.
+
+    Args:
+      data: numpy vector or a dict of such vectors
+      station_list: pandas table with station list
+      param: parameter descriptor
+      fcdate: forecast date (datetime object)
+      leadtime: lead time (int)
+      model_name: model name (string)
+
+    Returns:
+      pandas table
+    """
+    station_keys = ["station_id", "lat", "lon"]
+    table = station_list[station_keys].copy()
+
+    # prepare SQLITE output
+    fcd = int(fcdate.timestamp())
+    vad = int(fcdate.timestamp() + leadtime)
+
+    table["fcst_dttm"] = fcd
+    # NOTE: currently FCTABLE still expects leadtime in hours!
+    table["lead_time"] = leadtime / 3600.0
+    table["valid_dttm"] = vad
+    table["parameter"] = param["harp_param"]
+    table["units"] = param["units"]
+    logger.debug("SQLITE: writing parameter %s", param["harp_param"])
+    # model_elevation only relevant for T2m
+    # NOTE: we can not yet read model elevation from clim file!
+    # otherwise remove column
+    if "T2m" in param["harp_param"]:
+        if "model_elevation" not in table.columns.to_numpy().tolist():
+            table["model_elevation"] = 0
+        if "elev" not in table.columns.to_numpy().tolist():
+            table["elev"] = 0
+    else:
+        if "model_elevation" in table.columns.to_numpy().tolist():
+            table = table.drop("model_elevation", axis=1)
+        if "elev" in table.columns.to_numpy().tolist():
+            table = table.drop("elev", axis=1)
+
+    if param["level"] is not None and param["level_name"] is not None:
+        table[param["level_name"]] = int(param["level"])
+    # the actual data column(s)
+    # note that we want to order the members in the final table!
+    if isinstance(data, dict):
+        for mbr, data_vector in sorted(data.items()):
+            col_name = mbr_column(model_name, mbr)
+            table[col_name] = data_vector
+    else:
+        col_name = mbr_column(model_name, None)
+        table[col_name] = data
+
+    return table
+
+
+def write_to_sqlite(sqlite_file, table, param, model_name, n_members=None):
+    """Write a data table to SQLite.
+
+    Args:
+        table: a data table
+        sqlite_file: file name
+        param: parameter descriptor
+        model_name: model name used in file path and data table
+        n_members: number of ensemble members
+    """
+    logger.debug("Writing to %s", sqlite_file)
+    fcdate = float(table.iloc[0]["fcst_dttm"])
+    leadtime = float(table.iloc[0]["lead_time"])
     # Serialise file creation and schema patching across parallel workers.
     # Without this lock, two threads can both see os.path.isfile()==False and
     # both call db_create, producing "duplicate column name" errors.
@@ -1380,174 +1513,19 @@ def _flush_ensemble(accum, station_list, model_name, sqlite_template):
             # File pre-existed: patch any member columns that may be missing
             # (e.g. file created by an earlier partial flush or a different run).
             needs_column_check = True
-
         con = sqlite3.connect(sqlite_file)
         con.execute("PRAGMA journal_mode=WAL")
         con.execute("PRAGMA busy_timeout = 30000")  # wait up to 30 s before failing
 
         if needs_column_check:
-            _ensure_member_columns(con, model_name, sorted(accum.members.keys()))
+            mbr_columns = list_mbr_columns(table, model_name)
+            ensure_table_columns(con, mbr_columns)
 
-        con.commit()
-        con.execute("PRAGMA busy_timeout = 30000")  # wait up to 30 s before failing
-
-    # Schema is now stable — the data write itself is safe outside the lock
-    # because SQLite WAL mode allows concurrent writers at the row level.
-    con = sqlite3.connect(sqlite_file)
-    con.execute("PRAGMA journal_mode=WAL")
-
-    fcd = float(fcdate.timestamp())
-    db_cleanup(param, fcd, float(leadtime / 3600.0), con)
-
-    # Build one combined pandas table with all member columns in a single pass.
-    first_mbr_num = min(accum.members.keys())
-    first_col = mbr_column(model_name, first_mbr_num)
-
-    combined = create_table(
-        accum.members[first_mbr_num],
-        station_list,
-        param,
-        fcdate,
-        leadtime,
-        first_col,
-    )
-    # Add remaining member columns (first_col is already set above)
-    for mbr_num, data_vector in sorted(accum.members.items()):
-        col = mbr_column(model_name, mbr_num)
-        combined[col] = data_vector
-
-    combined.to_sql("FC", con, if_exists="append", index=False)
-    con.commit()
-    con.close()
-
-    logger.debug(
-        "SQLITE: flushed %i members for %s fcdate=%s leadtime=%s",
-        len(accum.members),
-        param["harp_param"],
-        fcdate,
-        leadtime,
-    )
-
-
-def _ensure_member_columns(con, model_name, member_numbers):
-    """Add any missing _mbrNNN columns to an existing FC table.
-
-    This is needed when the SQLite file was created by an earlier run
-    with a different (smaller) member set.
-
-    Args:
-        con            : open sqlite3 connection
-        model_name     : base model name
-        member_numbers : iterable of integer member numbers
-    """
-    cur = con.cursor()
-    # PRAGMA table_info returns rows of (cid, name, type, notnull, dflt_value, pk)
-    existing = {row[1] for row in cur.execute("PRAGMA table_info(FC)").fetchall()}
-    for mbr in member_numbers:
-        col = mbr_column(model_name, mbr)
-        if col not in existing:
-            cur.execute(f"ALTER TABLE FC ADD COLUMN {col} DOUBLE")
-    con.commit()
-
-
-def create_table(data_vector, station_list, param, fcdate, leadtime, model_name):
-    """Put a data vector (interpolated field) to pandas table.
-
-    Args:
-      data_vector: numpy vector with interpolated values
-      station_list: pandas table with station list
-      param: parameter descriptor
-      fcdate: forecast date (datetime object)
-      leadtime: lead time (int)
-      model_name: model name (string)
-
-    Returns:
-      pandas table
-    """
-
-    data = station_list[prim_keys].copy()
-    # NOTE: only deterministic models for now! No EPS.
-    data[model_name] = data_vector
-
-    # prepare SQLITE output
-    fcd = int(fcdate.timestamp())
-    vad = int(fcdate.timestamp() + leadtime)
-
-    data["fcst_dttm"] = fcd
-    # NOTE: currently FCTABLE still expects leadtime in hours!
-    data["lead_time"] = leadtime / 3600.0
-    data["valid_dttm"] = vad
-    data["parameter"] = param["harp_param"]
-    data["units"] = param["units"]
-    logger.debug("SQLITE: writing parameter %s", param["harp_param"])
-    # model_elevation only relevant for T2m
-    # NOTE: we can not yet read model elevation from clim file!
-    # otherwise remove column
-    if "T2m" in param["harp_param"]:
-        if "model_elevation" not in data.columns.to_numpy().tolist():
-            data["model_elevation"] = 0
-        if "elev" not in data.columns.to_numpy().tolist():
-            data["elev"] = 0
-    else:
-        if "model_elevation" in data.columns.to_numpy().tolist():
-            data = data.drop("model_elevation", axis=1)
-        if "elev" in data.columns.to_numpy().tolist():
-            data = data.drop("elev", axis=1)
-
-    if param["level"] is not None and param["level_name"] is not None:
-        data[param["level_name"]] = int(param["level"])
-    return data
-
-
-def write_to_sqlite(data, sqlite_file, param, model_name):
-    """Write a data table to SQLite.
-
-    Args:
-        data: a data table
-        sqlite_file: file name
-        param: parameter descriptor
-        model_name: model name used in file path and data table
-    """
-    logger.debug("Writing to %s", sqlite_file)
-
-    if os.path.isfile(sqlite_file):
-        con = sqlite3.connect(sqlite_file)
-        con.execute("PRAGMA journal_mode=WAL")
-        con.execute("PRAGMA busy_timeout=30000")
-        # NOTE: If the table already exists,
-        #       we must check that all column names match!
-        #       Especially, we must check that the model name is identical.
-        #       Otherwise, the FC table should probably be deleted.
-        cur = con.cursor()
-        cn1 = cur.execute("select name from PRAGMA_TABLE_INFO('FC')").fetchall()
-        colnames = [x[0] for x in cn1]
-        if model_name not in colnames:
-            logger.error(
-                "ERROR: The FC table already exists with a different model name!"
-            )
-            con.close()
-            con = None
-    else:
-        sqlite_path = os.path.dirname(sqlite_file)
-        if not os.path.isdir(sqlite_path):
-            logger.info("SQLITE: Creating directory %s.", sqlite_path)
-            os.makedirs(sqlite_path)
-        # if the SQLite file doesn't exist yet: create the SQLite table
-        logger.info("SQLITE: Creating sqlite file %s.", sqlite_file)
-        con = db_create(sqlite_file, param, model_name)
-
-    if con is not None:
-        # NOTE: we need to cast to int (or float),
-        #       because "numpy.int64" will not work in SQL
-        #       for now, we take float, so the values can be sub-hourly
-        #       BUT: this may change if harpPoint gets support for sub-hourly data
-        fcd = float(data.iloc[0]["fcst_dttm"])
-        leadtime = float(data.iloc[0]["lead_time"])
         logger.debug("leadtime (h): %i", leadtime)
-        db_cleanup(param, fcd, leadtime, con)
+        db_cleanup(param, fcdate, leadtime, con)
 
         # now write to SQLite
-        data.to_sql("FC", con, if_exists="append", index=False)
+        table.to_sql("FC", con, if_exists="append", index=False)
         con.commit()
 
     con.close()
@@ -1627,6 +1605,7 @@ def db_create(sqlite_file, param, model_name, n_members=None):
     )
 
     con = sqlite3.connect(sqlite_file)
+    con.execute("PRAGMA journal_mode=WAL")
     with con, closing(con.cursor()) as cur:
         cur.execute(fc_def)
         cur.execute(pk_def)
