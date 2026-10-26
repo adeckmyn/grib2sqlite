@@ -1090,7 +1090,6 @@ def parse_grib_file(
       model_name: model name (string) used in the SQLite file name and data columns
       ensemble: if True, treat the file as an ensemble GRIB file.
                 Member data are stored in columns named <model_name>_mbr001 etc.
-                The _det suffix is NOT added when ensemble=True.
                 Note that the productDefinitionTemplateNumber and typeOfStatisticalProcessing
                 keys differ from deterministic, therefore the param_list must be eps-specific.
     Returns:
@@ -1240,7 +1239,7 @@ def parse_grib_file(
                         param,
                         fcdate,
                         leadtime,
-                        model_name + "_det",
+                        model_name,
                     )
                     write_to_sqlite(data, sqlite_file, param, model_name, None)
 
@@ -1367,7 +1366,7 @@ def _flush_ensemble(accum, station_list, model_name, sqlite_template):
         leadtime,
         model_name,
     )
-    write_to_sqlite(sqlite_file, table, param, model_name, n_members)
+    write_to_sqlite(table, sqlite_file, param, model_name, n_members)
 
     logger.debug(
         "SQLITE: flushed %i members for %s fcdate=%s leadtime=%s",
@@ -1440,7 +1439,7 @@ def create_table(data, station_list, param, fcdate, leadtime, model_name):
     Returns:
       pandas table
     """
-    station_keys = ["station_id", "lat", "lon"]
+    station_keys = ["SID", "lat", "lon"]
     table = station_list[station_keys].copy()
 
     # prepare SQLITE output
@@ -1483,7 +1482,7 @@ def create_table(data, station_list, param, fcdate, leadtime, model_name):
     return table
 
 
-def write_to_sqlite(sqlite_file, table, param, model_name, n_members=None):
+def write_to_sqlite(table, sqlite_file, param, model_name, n_members=None):
     """Write a data table to SQLite.
 
     Args:

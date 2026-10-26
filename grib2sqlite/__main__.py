@@ -26,7 +26,7 @@ parser.add_argument(
     "-m",
     metavar="model_name",
     help="model name used in SQLite (usually <*>_det)",
-    default="TEST_det",
+    default="TEST",
 )
 parser.add_argument(
     "-t",
