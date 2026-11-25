@@ -6,6 +6,8 @@ import sqlite3
 import threading
 from contextlib import closing
 
+import numpy as np
+
 from .config import logger
 
 
@@ -162,7 +164,9 @@ def list_mbr_columns(table, model_name):
     return [col for col in table.columns if pattern.fullmatch(str(col))]
 
 
-def create_table(data, station_list, param, fcdate, leadtime, model_name):
+def create_table(
+    data, station_list, param, fcdate, leadtime, model_name, model_elevation=None
+):
     """Put a data vector (interpolated field) to pandas table.
 
     Args:
@@ -172,6 +176,8 @@ def create_table(data, station_list, param, fcdate, leadtime, model_name):
       fcdate: forecast date (datetime object)
       leadtime: lead time (int)
       model_name: model name (string)
+      model_elevation: model orography (m) interpolated to the stations
+                       (same order as station_list), or None if unknown
 
     Returns:
       pandas table
@@ -190,19 +196,19 @@ def create_table(data, station_list, param, fcdate, leadtime, model_name):
     table["parameter"] = param["harp_param"]
     table["units"] = param["units"]
     logger.debug("SQLITE: writing parameter %s", param["harp_param"])
-    # model_elevation only relevant for T2m
-    # NOTE: we can not yet read model elevation from clim file!
-    # otherwise remove column
+    # Station and model elevation are only written for T2m (and MAXT2m etc.).
+    # Unknown values are written as NULL (NaN), not 0, which is a real elevation.
     if "T2m" in param["harp_param"]:
-        if "model_elevation" not in table.columns.to_numpy().tolist():
-            table["model_elevation"] = 0
-        if "elev" not in table.columns.to_numpy().tolist():
-            table["elev"] = 0
-    else:
-        if "model_elevation" in table.columns.to_numpy().tolist():
-            table = table.drop("model_elevation", axis=1)
-        if "elev" in table.columns.to_numpy().tolist():
-            table = table.drop("elev", axis=1)
+        # station elevation from the station list (if it has an "elev" column)
+        if "elev" in station_list.columns:
+            table["elev"] = station_list["elev"]
+        else:
+            table["elev"] = np.nan
+        # model orography (from a clim file, see parse_grib_file)
+        if model_elevation is None:
+            table["model_elevation"] = np.nan
+        else:
+            table["model_elevation"] = np.asarray(model_elevation, dtype=float)
 
     if param["level"] is not None and param["level_name"] is not None:
         table[param["level_name"]] = int(param["level"])

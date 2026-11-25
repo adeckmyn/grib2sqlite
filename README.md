@@ -9,6 +9,7 @@ Can be called via command line or used as a module.
 
 usage: grib2sqlite [-h] [-p param_file] [-s station_file] [-m model_name]
                    [-t output_template] [-o output_path] [-d debug_level]
+                   [-e] [--det-member N] [-c clim_file] [--cleanup]
                    /path/to/file(s) [/path/to/file(s) ...]
 
 ### positional arguments:
@@ -27,6 +28,7 @@ usage: grib2sqlite [-h] [-p param_file] [-s station_file] [-m model_name]
 *  -d <debug_level>      verbosity level (0...3) default: 1
 *  -e, --ensemble        treat input as ensemble data (members in _mbrNNN columns)
 *  --det-member <N>      with -e, member number used for records without a perturbationNumber (default: 0, i.e. _mbr000)
+*  -c, --clim <clim_file>  GRIB file with the model orography, written as `model_elevation` for T2m (see below)
 *  --cleanup            delete existing rows for the written keys before upserting (default: merge/upsert only)
 
 Option `-d0` surpresses all messages except errors, `-d1` adds warnings, and so on up to `-d3` that will output a large amount of debugging information.
@@ -50,8 +52,18 @@ The .csv should have (at least) the following columns:
 
 * **SID**: Station ID (e.g. WMO code)
 * **lat**, **lon**: latitude and longitude
-* **elev**: elevation above sea level (optional, currently not used)
+* **elev**: elevation above sea level (optional). Written to the `elev` column for T2m parameters; NULL if the column is absent.
 * **name**
+
+## Model elevation
+
+For T2m parameters (any parameter name containing `T2m`), the SQLite tables also get the columns `elev` (station elevation, from the station list) and `model_elevation` (model orography interpolated to the station). Unknown values are written as NULL.
+
+The model orography is read from a separate GRIB file given with `-c`/`--clim`, typically a climate file:
+
+    python3 -m grib2sqlite -c clim.grib2 -m MYMODEL fc*.grib2
+
+The first record with shortName `z`, `orog`, `h` or `gh` at `typeOfLevel=surface` is used and interpolated bilinearly; geopotential (m2 s-2) is converted to metres. The file must be on the same grid as the forecast data: this is checked, and the run stops if the grids differ. A forecast file that itself contains the surface orography can also be passed as its own clim file. No height correction is applied to T2m.
 
 ## Parameter list
 

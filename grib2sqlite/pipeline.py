@@ -3,6 +3,7 @@
 from copy import deepcopy
 
 import eccodes
+import numpy as np
 
 from .config import (
     default_parameter_list,
@@ -10,7 +11,13 @@ from .config import (
     default_station_list,
     logger,
 )
-from .grib import get_date_info, get_ensemble_info
+from .grib import (
+    get_date_info,
+    get_ensemble_info,
+    get_grid_signature,
+    get_keylist,
+    same_grid,
+)
 from .params import (
     cache_field,
     combine_fields,
@@ -84,7 +91,14 @@ def _ens_key(param, fcdate, leadtime):
     return (param["harp_param"], fcdate, leadtime, level)
 
 
-def _flush_ensemble(accum, station_list, model_name, sqlite_template, cleanup=False):
+def _flush_ensemble(
+    accum,
+    station_list,
+    model_name,
+    sqlite_template,
+    cleanup=False,
+    model_elevation=None,
+):
     """Write all accumulated ensemble members for one (param, fcdate, leadtime) to SQLite.
 
     Each member is stored in a separate column named <model_name>_mbr001, …
@@ -95,6 +109,7 @@ def _flush_ensemble(accum, station_list, model_name, sqlite_template, cleanup=Fa
         model_name     : base model name (no suffix)
         sqlite_template: template string for the output SQLite path
         cleanup        : if True, delete existing rows for the key before upserting
+        model_elevation: model orography at the stations, or None
     """
     param = accum.param
     fcdate = accum.fcdate
@@ -110,6 +125,7 @@ def _flush_ensemble(accum, station_list, model_name, sqlite_template, cleanup=Fa
         fcdate,
         leadtime,
         model_name,
+        model_elevation=model_elevation,
     )
     write_to_sqlite(table, sqlite_file, param, model_name, n_members, cleanup=cleanup)
 
@@ -122,6 +138,96 @@ def _flush_ensemble(accum, station_list, model_name, sqlite_template, cleanup=Fa
     )
 
 
+# Standard gravity, to convert surface geopotential (m2 s-2) to metres.
+GRAVITY = 9.80665
+# shortNames accepted as model orography (at typeOfLevel "surface").
+OROGRAPHY_NAMES = ("z", "orog", "h", "gh")
+
+
+def read_model_elevation(clim_file, station_list, weights=None):
+    """Read the model orography from a (clim) GRIB file and interpolate it.
+
+    The first record with one of the shortNames in OROGRAPHY_NAMES at
+    typeOfLevel "surface" is used. Geopotential (m2 s-2) is converted to m.
+    If no weights are given, the station list is restricted to the domain and
+    the interpolation weights are trained on this record. So the clim file
+    must be on the same grid as the data (see same_grid).
+
+    Args:
+        clim_file: name of a GRIB file containing the model orography
+        station_list: pandas table with station info
+        weights: interpolation weights (if None, they are calculated)
+
+    Returns:
+        station_list (possibly restricted), weights, model elevation at the
+        stations (numpy array, m) and the grid signature of the clim record.
+
+    Raises:
+        ValueError: if no usable orography record is found, its units are not
+                    recognised or no station lies inside the domain.
+    """
+    with open(clim_file, "rb") as gfile:
+        while True:
+            gid = eccodes.codes_grib_new_from_file(gfile)
+            if gid is None:
+                break
+            try:
+                info = get_keylist(
+                    gid, ["shortName", "typeOfLevel", "parameterUnits"], "string"
+                )
+                if (
+                    info["shortName"] in OROGRAPHY_NAMES
+                    and info["typeOfLevel"] == "surface"
+                ):
+                    return _interp_model_elevation(
+                        gid, info, clim_file, station_list, weights
+                    )
+            finally:
+                eccodes.codes_release(gid)
+    raise ValueError(
+        f"No model orography ({'/'.join(OROGRAPHY_NAMES)} at surface) "
+        f"found in {clim_file}."
+    )
+
+
+def _interp_model_elevation(gid, info, clim_file, station_list, weights):
+    """Interpolate an orography record to the stations (see read_model_elevation)."""
+    units = info["parameterUnits"]
+    # eccodes spells units differently between versions ("m**2 s**-2" vs "m2 s-2")
+    units_norm = units.replace("**", "").replace("^", "").replace(" ", "")
+    if units_norm == "m2s-2":
+        scale = 1.0 / GRAVITY
+    elif units_norm in ("m", "gpm"):
+        scale = 1.0
+    else:
+        raise ValueError(
+            f"Unexpected units {units!r} for orography {info['shortName']} "
+            f"in {clim_file}."
+        )
+
+    if weights is None:
+        nstation_orig = station_list.shape[0]
+        station_list = points_restrict(gid, station_list)
+        if station_list.shape[0] == 0:
+            raise ValueError(f"No stations inside the domain of {clim_file}.")
+        logger.info(
+            "SQLITE: selected %i stations inside domain from %i.",
+            station_list.shape[0],
+            nstation_orig,
+        )
+        logger.debug("SQLITE: training interpolation weights on clim file.")
+        weights = train_weights(station_list, gid, lsm=False)
+
+    model_elevation = np.asarray(interp_from_weights(gid, weights, "bilin")) * scale
+    logger.info(
+        "SQLITE: model elevation from %s (%s, %s).",
+        clim_file,
+        info["shortName"],
+        units,
+    )
+    return station_list, weights, model_elevation, get_grid_signature(gid)
+
+
 def parse_grib_file(
     infile,
     param_list=default_parameter_list,
@@ -132,6 +238,7 @@ def parse_grib_file(
     ensemble=False,
     det_member=0,
     cleanup=False,
+    clim_file=None,
 ):
     """Read a GRIB2 file and extract all required data points to SQLite.
 
@@ -150,6 +257,9 @@ def parse_grib_file(
                   perturbationNumber; written as <model_name>_mbrNNN. Default 0.
       cleanup: if True, delete all existing rows for the written keys before
                upserting. By default rows are merged (upsert only).
+      clim_file: GRIB file with the model orography (on the same grid as
+                 infile), written as model_elevation for T2m. If None,
+                 model_elevation is NULL.
     Returns:
         Total number of GRIB records and number of matching parameters found.
     """
@@ -160,6 +270,14 @@ def parse_grib_file(
         station_list = read_station_list(station_list)
     if isinstance(param_list, str):
         param_list = read_param_list(param_list)
+
+    # Model orography is read first, so it is available for all T2m fields.
+    model_elevation = None
+    clim_grid = None
+    if clim_file is not None:
+        station_list, weights, model_elevation, clim_grid = read_model_elevation(
+            clim_file, station_list, weights
+        )
 
     # split into "combined" and "direct" parameters
     param_sgl_list, param_cmb_list = parse_parameter_list(param_list)
@@ -233,6 +351,17 @@ def parse_grib_file(
                 leadtime,
                 direct,
             )
+
+            if clim_grid is not None:
+                # The orography and weights come from the clim file: check
+                # (once) that the data are on the same grid.
+                if not same_grid(clim_grid, get_grid_signature(gid)):
+                    eccodes.codes_release(gid)
+                    raise ValueError(
+                        f"The grid of {infile} differs from the grid of the "
+                        f"clim file {clim_file}."
+                    )
+                clim_grid = None
 
             if weights is None:
                 # We assume that station list and weights are the same for all GRIB fields
@@ -309,6 +438,7 @@ def parse_grib_file(
                             model_name,
                             sqlite_template,
                             cleanup=cleanup,
+                            model_elevation=model_elevation,
                         )
                 else:
                     # this is a "direct" field, create a table and write to SQLite
@@ -322,6 +452,7 @@ def parse_grib_file(
                         fcdate,
                         leadtime,
                         model_name,
+                        model_elevation=model_elevation,
                     )
                     write_to_sqlite(
                         data,
@@ -353,7 +484,12 @@ def parse_grib_file(
             missing,
         )
         _flush_ensemble(
-            accum, station_list, model_name, sqlite_template, cleanup=cleanup
+            accum,
+            station_list,
+            model_name,
+            sqlite_template,
+            cleanup=cleanup,
+            model_elevation=model_elevation,
         )
 
     # Check all combined parameters and write to SQLite
@@ -413,6 +549,7 @@ def parse_grib_file(
                     model_name,
                     sqlite_template,
                     cleanup=cleanup,
+                    model_elevation=model_elevation,
                 )
         else:
             # Deterministic: single combine_fields call, write directly.
@@ -424,7 +561,13 @@ def parse_grib_file(
                 # Pass the base model name: create_table()/mbr_column() append
                 # the "_det" suffix once for deterministic fields.
                 data = create_table(
-                    data_vector, station_list, param, fcdate, leadtime, model_name
+                    data_vector,
+                    station_list,
+                    param,
+                    fcdate,
+                    leadtime,
+                    model_name,
+                    model_elevation=model_elevation,
                 )
                 write_to_sqlite(data, sqlite_file, param, model_name, cleanup=cleanup)
 

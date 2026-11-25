@@ -18,11 +18,13 @@ from .grib import (
     date_from_gribinfo,
     get_date_info,
     get_ensemble_info,
+    get_grid_signature,
     get_grid_values,
     get_gridinfo,
     get_keylist,
     get_proj4,
     proj4_to_string,
+    same_grid,
 )
 from .params import (
     cache_field,
@@ -38,6 +40,7 @@ from .pipeline import (
     _ens_key,
     _flush_ensemble,
     parse_grib_file,
+    read_model_elevation,
 )
 from .spatial import (
     get_grid_boundary,
@@ -98,6 +101,7 @@ __all__ = [
     "get_grid_boundary",
     "get_grid_limits",
     "get_grid_points",
+    "get_grid_signature",
     "get_grid_values",
     "get_gridindex",
     "get_gridinfo",
@@ -113,9 +117,11 @@ __all__ = [
     "param_match",
     "points_restrict",
     "proj4_to_string",
+    "read_model_elevation",
     "read_param_list",
     "read_station_list",
     "rotate_wind",
+    "same_grid",
     "sqlite_name",
     "train_weights",
     "write_to_sqlite",

@@ -63,6 +63,14 @@ parser.add_argument(
     "(default: 0 -> <model>_mbr000)",
 )
 parser.add_argument(
+    "-c",
+    "--clim",
+    metavar="clim_file",
+    default=None,
+    help="GRIB file with the model orography (surface z, orog, h or gh) on the "
+    "same grid as the data; written as model_elevation for T2m",
+)
+parser.add_argument(
     "--cleanup",
     action="store_true",
     help="delete existing rows for the written keys before upserting "
@@ -91,6 +99,7 @@ logger.info(f"GRIB file      : {infile}")
 logger.info(f"Parameter list : {param_file}")
 logger.info(f"Station list   : {station_file}")
 logger.info(f"Model name     : {model_name}")
+logger.info(f"Clim file      : {args.clim}")
 logger.info(f"Output files   : {sqlite_template}")
 
 if len(infile) == 0:
@@ -127,4 +136,5 @@ for file_glob in infile:
             ensemble=args.ensemble,
             det_member=args.det_member,
             cleanup=args.cleanup,
+            clim_file=args.clim,
         )

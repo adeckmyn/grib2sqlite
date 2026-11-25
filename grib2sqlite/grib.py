@@ -309,6 +309,54 @@ def get_ensemble_info(gid):
     return int(pert), int(n_members)
 
 
+# Keys that together identify a grid (absent keys are None, e.g. DxInMetres
+# for lat/lon grids).
+_GRID_SIGNATURE_KEYS = [
+    "Nx",
+    "Ny",
+    "latitudeOfFirstGridPointInDegrees",
+    "longitudeOfFirstGridPointInDegrees",
+    "DxInMetres",
+    "DyInMetres",
+    "iDirectionIncrementInDegrees",
+    "jDirectionIncrementInDegrees",
+    "iScansNegatively",
+    "jScansPositively",
+]
+
+
+def get_grid_signature(gid):
+    """Read the keys that identify the grid of a GRIB record.
+
+    Args:
+        gid: GRIB handle
+
+    Returns:
+        dict of grid type and geometry keys (see same_grid)
+    """
+    signature = get_keylist(gid, ["gridType"], "string")
+    signature |= get_keylist(gid, _GRID_SIGNATURE_KEYS, "double")
+    return signature
+
+
+def same_grid(sig1, sig2, atol=1e-3, rtol=1e-6):
+    """Compare two grid signatures (from get_grid_signature).
+
+    Numerical values are compared with a small tolerance, so that e.g. GRIB-1
+    (millidegrees) and GRIB-2 (microdegrees) encodings of the same grid are
+    considered equal.
+    """
+    for key in sig1.keys() | sig2.keys():
+        a = sig1.get(key)
+        b = sig2.get(key)
+        if a is None or b is None or isinstance(a, str) or isinstance(b, str):
+            if a != b:
+                return False
+        elif abs(a - b) > max(atol, rtol * max(abs(a), abs(b))):
+            return False
+    return True
+
+
 def get_grid_values(gid):
     """Decode a GRIB2 field.
 
