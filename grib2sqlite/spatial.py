@@ -263,9 +263,9 @@ def train_weights(station_list, gid, lsm=False):
     if gridinfo["wrap_x"]:
         logger.info("The domain wraps around the globe.")
         ic[ic == gridinfo["nlon"]] = 0
-        ic[ic == -1] = gridinfo["nlon"]
+        ic[ic == -1] = gridinfo["nlon"] - 1
         i1[i1 == gridinfo["nlon"]] = 0
-        i0[i0 == -1] = gridinfo["nlon"]
+        i0[i0 == -1] = gridinfo["nlon"] - 1
 
     for pp in range(nstations):
         nearestweights.append([[[ic[pp], jc[pp]], 1.0]])

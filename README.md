@@ -116,6 +116,8 @@ For this, **grib_id** can contain the different fields in a list (**NOTE:** in t
 
 Future additions may include elevation-correction for T2m, dew point temperature (Magnus formula), ...
 
+**Limitation:** combined fields assume that each GRIB file contains a single forecast date and lead time. The component fields are cached (one slot per parameter and level) and only combined after the whole file has been read, using the forecast date and lead time of the last matching record in the file. If a file contains several lead times, only one combined value per parameter is written, and it may mix components from different lead times or be stored under the wrong lead time. No warning is given. Single (direct) parameters are not affected. Until this is fixed, split such files into one file per lead time before processing (e.g. with `grib_copy -w step=6 in.grib2 out.grib2`, or `grib_copy in.grib2 'out_[step].grib2'`).
+
 Examples:
 
 ```

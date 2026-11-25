@@ -310,31 +310,28 @@ def write_to_sqlite(
     fcdate = float(table.iloc[0]["fcst_dttm"])
     leadtime = float(table.iloc[0]["lead_time"])
     mbr_columns = sorted(list_mbr_columns(table, model_name))
-    # Serialise file creation and schema patching across parallel workers.
-    # Without this lock, two threads can both see os.path.isfile()==False and
-    # both call db_create, producing "duplicate column name" errors.
+    # Serialise table creation and schema patching across parallel workers.
+    # Without this lock, two threads can both find no FC table (or both add
+    # the same missing member column), producing "duplicate column name" errors.
     file_lock = _get_file_lock(sqlite_file)
     with file_lock:
-        if not os.path.isfile(sqlite_file):
-            sqlite_path = os.path.dirname(sqlite_file)
-            if sqlite_path and not os.path.isdir(sqlite_path):
-                logger.info("SQLITE: Creating directory %s.", sqlite_path)
-                os.makedirs(sqlite_path, exist_ok=True)
-            logger.info("SQLITE: Creating sqlite file %s.", sqlite_file)
-            # NOTE: to create the table, we should know exactly which members are present
-            #       so we don't create empty columns.
-            db_create(sqlite_file, param, model_name, n_members, mbr_columns)
-            needs_column_check = False
-        else:
-            # File pre-existed: patch any member columns that may be missing
-            # (e.g. file created by an earlier partial flush or a different run).
-            needs_column_check = True
+        sqlite_path = os.path.dirname(sqlite_file)
+        if sqlite_path and not os.path.isdir(sqlite_path):
+            logger.info("SQLITE: Creating directory %s.", sqlite_path)
+            os.makedirs(sqlite_path, exist_ok=True)
         with closing(sqlite3.connect(sqlite_file)) as con:
             _configure_connection(con)
 
-            if needs_column_check:
-                mbr_columns = list_mbr_columns(table, model_name)
-                ensure_table_columns(con, mbr_columns)
+            # Check for the FC table, not for the file: a run that was
+            # interrupted (or failed) may have left a file without FC table.
+            if not _fc_table_exists(con):
+                logger.info("SQLITE: Creating FC table in %s.", sqlite_file)
+                # NOTE: to create the table, we should know exactly which members are present
+                #       so we don't create empty columns.
+                _create_fc_table(con, param, model_name, n_members, mbr_columns)
+            # Patch any member columns that may be missing (e.g. table created
+            # by an earlier partial flush, a different run or another process).
+            ensure_table_columns(con, mbr_columns)
 
             conflict_columns = _upsert_conflict_columns(con, table)
             if conflict_columns is None:
@@ -401,8 +398,40 @@ def db_create(sqlite_file, param, model_name, n_members=None, member_columns=Non
     "unique index" approach.
     The table contains one column per member: <model_name>_mbr001
 
+    NOTE: no longer called internally: write_to_sqlite() creates the table
+          itself via _create_fc_table(). Kept for external code that imports
+          it (it is re-exported by the grib2sqlite.grib2sqlite facade).
+
     Args:
       sqlite_file: SQLite file name
+      param: parameter descriptor
+      model_name: model name used in SQLite
+      n_members: number of ensemble members (default=None for deterministic)
+      member_columns: list of ensemble members available in the data
+    """
+    with closing(sqlite3.connect(sqlite_file)) as con:
+        _configure_connection(con)
+        _create_fc_table(con, param, model_name, n_members, member_columns)
+
+
+def _fc_table_exists(con):
+    """Return True if the database already contains an FC table."""
+    row = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'FC'"
+    ).fetchone()
+    return row is not None
+
+
+def _create_fc_table(con, param, model_name, n_members=None, member_columns=None):
+    """Create the FC table and its unique index on an open connection.
+
+    Both statements run in one explicit transaction, so the table never exists
+    without its unique index (the sqlite3 module would otherwise commit each
+    DDL statement separately). Both use IF NOT EXISTS, so this is a no-op for
+    an existing table.
+
+    Args:
+      con: open sqlite3 connection (not inside a transaction)
       param: parameter descriptor
       model_name: model name used in SQLite
       n_members: number of ensemble members (default=None for deterministic)
@@ -428,11 +457,16 @@ def db_create(sqlite_file, param, model_name, n_members=None, member_columns=Non
         + ")"
     )
 
-    with closing(sqlite3.connect(sqlite_file)) as con:
-        _configure_connection(con)
-        with con, closing(con.cursor()) as cur:
-            cur.execute(fc_def)
-            cur.execute(pk_def)
+    # IMMEDIATE takes the write lock up front (waiting up to busy_timeout if
+    # another process holds it).
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        con.execute(fc_def)
+        con.execute(pk_def)
+    except BaseException:
+        con.rollback()
+        raise
+    con.commit()
 
 
 def fctable_definition(param, model_name, n_members=None, member_columns=None):
