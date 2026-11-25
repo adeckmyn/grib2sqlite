@@ -214,7 +214,17 @@ def parse_grib_file(
             gi += 1
             # NOTE: actually, we only need to get fcdate & lead time once
             #       and we could even consider those to be known
-            fcdate, leadtime = get_date_info(gid)
+            try:
+                fcdate, leadtime = get_date_info(gid)
+            except ValueError as err:
+                logger.error(
+                    "SQLITE: skipping record %i (%s): %s",
+                    gt,
+                    param["harp_param"],
+                    err,
+                )
+                eccodes.codes_release(gid)
+                continue
             logger.debug(
                 "SQLITE: gt=%i gi=%i fcdate=%s, leadtime=%i, direct=%s",
                 gt,

@@ -45,14 +45,41 @@ def get_date_info(gid):
         info2 = get_keylist(gid, keys2, "long")
         info = info | info2
 
-        if info2["productDefinitionTemplateNumber"] == 8:
-            keys3 = [
-                "indicatorOfUnitForTimeRange",
-                "lengthOfTimeRange",
-            ]
-            info3 = get_keylist(gid, keys3, "long")
-            info = info | info3
+        # Statistically processed fields (PDT 8, but also ensemble PDT 11, 12,
+        # ...) have a time interval. The keys are absent for instantaneous
+        # templates, in which case get_keylist returns None.
+        keys3 = [
+            "indicatorOfUnitForTimeRange",
+            "lengthOfTimeRange",
+        ]
+        info3 = get_keylist(gid, keys3, "long")
+        info = info | info3
     return date_from_gribinfo(info)
+
+
+# Seconds per unit, following GRIB2 code table 4.4 (also used by eccodes for
+# the "stepUnits" key in GRIB-1).
+_TIME_UNIT_SECONDS = {
+    0: 60.0,  # minute
+    1: 3600.0,  # hour
+    2: 86400.0,  # day
+    10: 3 * 3600.0,  # 3 hours
+    11: 6 * 3600.0,  # 6 hours
+    12: 12 * 3600.0,  # 12 hours
+    13: 1.0,  # second
+}
+
+
+def _time_unit_seconds(tunit, keyname):
+    """Convert a GRIB code table 4.4 time unit to seconds.
+
+    Raises:
+        ValueError: for missing or unsupported units (e.g. month, year).
+    """
+    try:
+        return _TIME_UNIT_SECONDS[tunit]
+    except KeyError:
+        raise ValueError(f"Unsupported {keyname}: {tunit}") from None
 
 
 def date_from_gribinfo(info):
@@ -64,6 +91,8 @@ def date_from_gribinfo(info):
     Returns:
         forecast date (datetime object) and lead time (in seconds!)
 
+    Raises:
+        ValueError: if the time unit(s) can not be interpreted.
     """
     fcdate = datetime.strptime(
         "{:8}T{:02}{:02}{:02}".format(
@@ -75,35 +104,22 @@ def date_from_gribinfo(info):
     if info["editionNumber"] == 1:
         tunit = info["stepUnits"]
         leadtime = info["endStep"]
+        unit_key = "stepUnits"
     else:
         tunit = info["indicatorOfUnitOfTimeRange"]
         leadtime = info["forecastTime"]
+        unit_key = "indicatorOfUnitOfTimeRange"
 
-    if tunit == 1:
-        tscale = 3600.0
-    elif tunit == 2:
-        tscale = 60.0
-    elif tunit == 13:
-        tscale = 1.0
-    else:
-        logger.error("Unrecognised indicatorOfUnitOfTimeRange: %i", tunit)
-        return None
+    leadtime *= _time_unit_seconds(tunit, unit_key)
 
-    leadtime *= tscale
-
-    # At this point, leadtime may be just the START of accumulation (or min/max/mean) time
-    if info["editionNumber"] == 2 and info["productDefinitionTemplateNumber"] == 8:
-        tunit2 = info["indicatorOfUnitForTimeRange"]  # NOTE: "For" vs "Of"
-        if tunit2 == 1:
-            lt2 = info["lengthOfTimeRange"] * 3600.0
-        elif tunit2 == 2:
-            lt2 = info["lengthOfTimeRange"] * 60.0
-        elif tunit2 == 13:
-            lt2 = info["lengthOfTimeRange"]
-        else:
-            logger.error("Unrecognised indicatorOfUnitForTimeRange: %i", tunit2)
-            return None
-        leadtime += lt2
+    # At this point, leadtime may be just the START of accumulation (or
+    # min/max/mean) time. Any template with a time interval (PDT 8, 11, 12...)
+    # carries lengthOfTimeRange: add it to get the end of the interval.
+    if info["editionNumber"] == 2 and info.get("lengthOfTimeRange") is not None:
+        tunit2 = info.get("indicatorOfUnitForTimeRange")  # NOTE: "For" vs "Of"
+        leadtime += info["lengthOfTimeRange"] * _time_unit_seconds(
+            tunit2, "indicatorOfUnitForTimeRange"
+        )
 
     return (fcdate, leadtime)
 
