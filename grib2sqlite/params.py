@@ -156,7 +156,8 @@ def combine_fields(param, station_list):
             lon = np.array(station_list["lon"].tolist())
             logger.debug("Correcting wind angle.")
             angle, _mapfactor = rotate_wind(lon, lat, param["proj4"])
-            wdir = wdir + angle
+            # keep the result in [0, 360)
+            wdir = np.mod(wdir + angle, 360)
 
         return wdir
 
@@ -173,12 +174,27 @@ def rotate_wind(lon, lat, p4):
 
     Returns:
         angle: correction angle in deg (vector) corresponding to every lat/lon location.
+               It is added to the grid-relative wind direction.
     """
     if p4["proj"] == "lcc":
         rad = np.pi / 180.0
-        refcos = np.cos(p4["lat_1"] * rad)
-        refsin = np.sin(p4["lat_1"] * rad)
-        angle = refsin * (lon - p4["lon_0"])
+        lat1 = p4["lat_1"]
+        lat2 = p4.get("lat_2", lat1)
+        refcos = np.cos(lat1 * rad)
+        refsin = np.sin(lat1 * rad)
+        # Cone constant: sin(lat_1) for a tangent cone, the secant formula
+        # otherwise (Snyder, eq. 15-3). Negative in the southern hemisphere.
+        if np.isclose(lat1, lat2):
+            cone = refsin
+        else:
+            cone = np.log(np.cos(lat1 * rad) / np.cos(lat2 * rad)) / np.log(
+                np.tan(np.pi / 4 + lat2 * rad / 2) / np.tan(np.pi / 4 + lat1 * rad / 2)
+            )
+        # Longitude difference in [-180, 180): GRIB gives LoV in [0, 360),
+        # station longitudes are usually in [-180, 180].
+        dlon = np.mod(np.asarray(lon) - p4["lon_0"] + 180.0, 360.0) - 180.0
+        angle = cone * dlon
+        # NOTE: mapfactor still assumes a tangent cone (it is not used).
         mapfactor = np.power(refcos / np.cos(lat * rad), 1 - refcos) * np.power(
             (1 + refsin) / (1 + np.sin(lat * rad)), refsin
         )
