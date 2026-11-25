@@ -375,7 +375,7 @@ def parse_grib_file(
             # highest perturbation number when that key was not available.
             n_members = param.get("n_members") or max(member_data.keys())
 
-            cmb_accum = _EnsembleAccumulator(n_members, param, fcdate, leadtime)
+            combined = {}
             for mbr_num, component_data in member_data.items():
                 # Temporarily swap in this member's component data so that
                 # combine_fields (which reads param["data"]) works unchanged.
@@ -384,7 +384,7 @@ def parse_grib_file(
                 param["data"] = component_data
                 data_vector = combine_fields(param, station_list)
                 if data_vector is not None:
-                    cmb_accum.add(mbr_num, data_vector)
+                    combined[mbr_num] = data_vector
                 else:
                     logger.info(
                         "COMBINE: missing component for %s member %i – skipping member.",
@@ -392,7 +392,13 @@ def parse_grib_file(
                         mbr_num,
                     )
 
-            if cmb_accum.members:
+            if combined:
+                # Create the accumulator only now: it takes a copy of param,
+                # and combine_fields may have modified it (e.g. units="deg"
+                # for wind direction).
+                cmb_accum = _EnsembleAccumulator(n_members, param, fcdate, leadtime)
+                for mbr_num, data_vector in combined.items():
+                    cmb_accum.add(mbr_num, data_vector)
                 missing = cmb_accum.missing_members()
                 if missing:
                     logger.info(
