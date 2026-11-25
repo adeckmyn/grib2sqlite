@@ -442,7 +442,7 @@ def fctable_definition(param, model_name, n_members=None, member_columns=None):
         S(primary_keys, other_keys) – both ordered dicts of {col_name: sql_type}
     """
     primary_keys = {"fcst_dttm": "DOUBLE", "lead_time": "DOUBLE", "SID": "INT"}
-    if param["level_name"] in ["z", "p", "h"]:
+    if param["level_name"] in ["z", "p", "ml"]:
         primary_keys[param["level_name"]] = "INT"
 
     other_keys = {
