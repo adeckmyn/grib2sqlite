@@ -233,8 +233,6 @@ def train_weights(station_list, gid, lsm=False):
     gridinfo = get_gridinfo(gid)
     # eccodes python interface only gives us distances
     # so we need to do some math for bilinear weights
-    nearestweights = []
-    bilinweights = []
     # assuming the 4 closest points are exactly what we need (OK if dx=dy)
     # NOTE: this assumes dx == dy !!!
     # otherwise, you have to check whether 2nd point is along X or Y axis from first
@@ -267,19 +265,35 @@ def train_weights(station_list, gid, lsm=False):
         i1[i1 == gridinfo["nlon"]] = 0
         i0[i0 == -1] = gridinfo["nlon"] - 1
 
-    for pp in range(nstations):
-        nearestweights.append([[[ic[pp], jc[pp]], 1.0]])
-        bilinweights.append(
-            [
-                [[i0[pp], j0[pp]], w1[pp]],
-                [[i0[pp], j1[pp]], w2[pp]],
-                [[i1[pp], j0[pp]], w3[pp]],
-                [[i1[pp], j1[pp]], w4[pp]],
-            ]
-        )
-
-    weights = {"bilin": bilinweights, "nearest": nearestweights}
+    # Weights per method as arrays of shape (nstations, npoints):
+    # grid indices i, j and weights w, such that
+    #     value[p] = sum_k data[i[p, k], j[p, k]] * w[p, k]
+    weights = {
+        "bilin": {
+            "i": np.stack([i0, i0, i1, i1], axis=1),
+            "j": np.stack([j0, j1, j0, j1], axis=1),
+            "w": np.stack([w1, w2, w3, w4], axis=1),
+        },
+        "nearest": {
+            "i": ic[:, np.newaxis],
+            "j": jc[:, np.newaxis],
+            "w": np.ones((nstations, 1)),
+        },
+    }
     return weights
+
+
+def _weight_arrays(method_weights):
+    """Return the (i, j, w) arrays of one interpolation method.
+
+    Also accepts the old format (a list per station of [[i, j], w] pairs),
+    for weights created outside this package.
+    """
+    if isinstance(method_weights, dict):
+        return method_weights["i"], method_weights["j"], method_weights["w"]
+    idx = np.array([[pt[0] for pt in st] for st in method_weights], dtype="i4")
+    w = np.array([[pt[1] for pt in st] for st in method_weights], dtype=float)
+    return idx[..., 0], idx[..., 1], w
 
 
 def interp_from_weights(gid, weights, method):
@@ -287,14 +301,13 @@ def interp_from_weights(gid, weights, method):
 
     Args:
         gid: grib handle
-        weights: interpolation weights
+        weights: interpolation weights (see train_weights)
         method: interpolation method (bilin, nearest)
 
     Returns:
-        interpolated values
+        numpy array of interpolated values (one per station)
     """
     # NOTE: this assumes all records in a file use the same grid representation
-
     data = get_grid_values(gid)
-    interp = [sum([data[x[0][0], x[0][1]] * x[1] for x in w]) for w in weights[method]]
-    return interp
+    i, j, w = _weight_arrays(weights[method])
+    return (data[i, j] * w).sum(axis=1)
