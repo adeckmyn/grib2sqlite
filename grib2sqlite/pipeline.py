@@ -9,6 +9,7 @@ from .config import (
     default_parameter_list,
     default_sqlite_template,
     default_station_list,
+    Grib2SqliteError,
     logger,
 )
 from .grib import (
@@ -163,8 +164,8 @@ def read_model_elevation(clim_file, station_list, weights=None):
         stations (numpy array, m) and the grid signature of the clim record.
 
     Raises:
-        ValueError: if no usable orography record is found, its units are not
-                    recognised or no station lies inside the domain.
+        Grib2SqliteError: if no usable orography record is found, its units are
+                          not recognised or no station lies inside the domain.
     """
     with open(clim_file, "rb") as gfile:
         while True:
@@ -184,7 +185,7 @@ def read_model_elevation(clim_file, station_list, weights=None):
                     )
             finally:
                 eccodes.codes_release(gid)
-    raise ValueError(
+    raise Grib2SqliteError(
         f"No model orography ({'/'.join(OROGRAPHY_NAMES)} at surface) "
         f"found in {clim_file}."
     )
@@ -200,7 +201,7 @@ def _interp_model_elevation(gid, info, clim_file, station_list, weights):
     elif units_norm in ("m", "gpm"):
         scale = 1.0
     else:
-        raise ValueError(
+        raise Grib2SqliteError(
             f"Unexpected units {units!r} for orography {info['shortName']} "
             f"in {clim_file}."
         )
@@ -209,7 +210,7 @@ def _interp_model_elevation(gid, info, clim_file, station_list, weights):
         nstation_orig = station_list.shape[0]
         station_list = points_restrict(gid, station_list)
         if station_list.shape[0] == 0:
-            raise ValueError(f"No stations inside the domain of {clim_file}.")
+            raise Grib2SqliteError(f"No stations inside the domain of {clim_file}.")
         logger.info(
             "SQLITE: selected %i stations inside domain from %i.",
             station_list.shape[0],
@@ -262,6 +263,10 @@ def parse_grib_file(
                  model_elevation is NULL.
     Returns:
         Total number of GRIB records and number of matching parameters found.
+
+    Raises:
+        Grib2SqliteError: if the file can not be processed (no stations inside
+                          the domain, problems with the clim file, ...).
     """
     if det_member < 0:
         raise ValueError("det_member must be a non-negative integer")
@@ -298,7 +303,6 @@ def parse_grib_file(
     gi = 0
     gd = 0
     gc = 0
-    error_occured = False
 
     with open(infile, "rb") as gfile:
         while True:
@@ -357,7 +361,7 @@ def parse_grib_file(
                 # (once) that the data are on the same grid.
                 if not same_grid(clim_grid, get_grid_signature(gid)):
                     eccodes.codes_release(gid)
-                    raise ValueError(
+                    raise Grib2SqliteError(
                         f"The grid of {infile} differs from the grid of the "
                         f"clim file {clim_file}."
                     )
@@ -371,10 +375,10 @@ def parse_grib_file(
                 station_list = points_restrict(gid, station_list)
                 if station_list.shape[0] == 0:
                     # In this case, we can not extract any points
-                    logger.warning("SQLite: no stations inside model domain!")
-                    error_occured = True
                     eccodes.codes_release(gid)
-                    break
+                    raise Grib2SqliteError(
+                        f"No stations inside the model domain of {infile}."
+                    )
 
                 logger.info(
                     "SQLITE: selected %i stations inside domain from %i.",
@@ -465,11 +469,7 @@ def parse_grib_file(
 
             eccodes.codes_release(gid)
 
-    # at this point, all grib records have been parsed (or an error occured)
-    if error_occured:
-        logger.error("An error occured. Exiting.")
-        return gt, gi
-
+    # at this point, all grib records have been parsed
     # Flush any accumulators that never reached n_members (missing members at
     # end of file).  This is normal for split ensemble files where the control
     # member (e.g. member 51) lives in a separate file.

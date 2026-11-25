@@ -6,6 +6,7 @@ historical import path working for code that imports from
 """
 
 from .config import (
+    Grib2SqliteError,
     basedir,
     console_handler,
     default_parameter_list,
@@ -72,6 +73,7 @@ from .sqlite import (
 )
 
 __all__ = [
+    "Grib2SqliteError",
     "_EnsembleAccumulator",
     "_ens_key",
     "_flush_ensemble",
