@@ -1,6 +1,7 @@
 """SQLite naming, schema, and write helpers."""
 
 import os
+import re
 import sqlite3
 import threading
 from contextlib import closing
@@ -144,7 +145,11 @@ def mbr_column(model_name, perturbation_number):
 
 
 def list_mbr_columns(table, model_name):
-    """List all ensemble member columns in a pandas table.
+    """List all model data columns in a pandas table.
+
+    These are the columns produced by mbr_column(): <model_name>_det and
+    <model_name>_mbrNNN. An exact pattern is used (not a substring match), so
+    that e.g. a model name "t" does not select "lat" or "units".
 
     Args:
         table: pandas DataFrame
@@ -153,7 +158,8 @@ def list_mbr_columns(table, model_name):
     Returns:
         list of column names
     """
-    return [col for col in table.columns if model_name in col]
+    pattern = re.compile(re.escape(model_name) + r"_(det|mbr\d+)")
+    return [col for col in table.columns if pattern.fullmatch(str(col))]
 
 
 def create_table(data, station_list, param, fcdate, leadtime, model_name):
@@ -464,7 +470,7 @@ def fctable_definition(param, model_name, n_members=None, member_columns=None):
             other_keys[mbr_column(model_name, None)] = "DOUBLE"
         else:
             for mbr in range(0, n_members):
-                other_keys[member_column(model_name, mbr)] = "DOUBLE"
+                other_keys[mbr_column(model_name, mbr)] = "DOUBLE"
     # for T2m correction
     if "T2m" in param["harp_param"]:
         other_keys["elev"] = "DOUBLE"
