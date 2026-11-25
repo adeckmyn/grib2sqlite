@@ -130,6 +130,8 @@ Future additions may include elevation-correction for T2m, dew point temperature
 
 **Limitation:** combined fields assume that each GRIB file contains a single forecast date and lead time. The component fields are cached (one slot per parameter and level) and only combined after the whole file has been read, using the forecast date and lead time of the last matching record in the file. If a file contains several lead times, only one combined value per parameter is written, and it may mix components from different lead times or be stored under the wrong lead time. No warning is given. Single (direct) parameters are not affected. Until this is fixed, split such files into one file per lead time before processing (e.g. with `grib_copy -w step=6 in.grib2 out.grib2`, or `grib_copy in.grib2 'out_[step].grib2'`).
 
+**Interpolation method of components:** a GRIB field that is used both as a single parameter and as a component of a combined parameter (or in several combined parameters) is interpolated only once, with the **method** of the parameter it matched first (single parameters are checked first). The **method** of the combined parameter is then not used for that component. Normally the same method suits a field whatever it is used for, so this is not expected to matter; if it does, give the parameters the same method.
+
 Examples:
 
 ```

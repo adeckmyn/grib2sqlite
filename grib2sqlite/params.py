@@ -312,6 +312,10 @@ def cache_field(
 ):
     """Check if a decoded field needs to be cached for later parameters.
 
+    NOTE: the cached data are interpolated with the method of the descriptor
+          that matched the record (param), not with the method of the
+          combined parameter.
+
     Args:
       param: parameter description of the current data
       data: decode (and interpolated) data
@@ -330,10 +334,23 @@ def cache_field(
     #       So often n_members reflect the "expected" number.
     count = 0
     gridinfo_list = ["uvRelativeToGrid"]
+
+    # Each component is matched against the GRIB record itself (the same test
+    # as in param_match), not against the descriptor that matched the record.
+    # So a field is also cached when it is a direct parameter, or a component
+    # of another combined parameter, with a differently written grib_id.
+    record_keys = {}  # key values of this record, each read only once
+
+    def record_matches(component):
+        todo = [k for k in component if k not in record_keys]
+        if todo:
+            record_keys.update(get_keylist(gid, todo, "string"))
+        return match_keys(component, {k: record_keys[k] for k in component})
+
     for cmb in param_cmb_list:
         nfields = len(cmb["grib_id"])
         for ff in range(nfields):
-            if match_keys(cmb["grib_id"][ff], param["grib_id"]):
+            if record_matches(cmb["grib_id"][ff]):
                 logger.debug("Caching output for %s", cmb["harp_param"])
                 if perturbation_number is None:
                     cmb["data"][ff] = np.array(data)
